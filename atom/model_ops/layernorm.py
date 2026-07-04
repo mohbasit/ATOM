@@ -12,14 +12,17 @@ from aiter import (
     rmsnorm2d_fwd,
     rmsnorm2d_fwd_with_add,
 )
-from aiter.dist.communication_op import tensor_model_parallel_fused_allreduce_rmsnorm
+from aiter.dist.communication_op import (
+    tensor_model_parallel_fused_allreduce_rmsnorm,
+    tensor_model_parallel_fused_allreduce_rmsnorm_quant,
+)
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from atom.config import QuantizationConfig
 from atom.model_ops.utils import atom_parameter
-from atom.quant_spec import LayerQuantConfig
+from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.utils.decorators import mark_trace
 from atom.utils import envs
 from torch import Tensor, nn
@@ -227,6 +230,8 @@ class RMSNorm(nn.Module):
         self.fused_allreduce = fused_allreduce
         self.use_fused_quant = fused_quant
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.quant_config = quant_config
+        self.prefix = prefix
 
         layer_quant_config = (
             LayerQuantConfig()
@@ -245,6 +250,67 @@ class RMSNorm(nn.Module):
             and quant_type.value == _QV_PER_1X128
             and envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
         )
+
+    def process_weights_after_loading(self):
+        """Post-load hook invoked by the model loader for every module.
+
+        RMSNorm has no weights to re-quantize, but when online quantization is
+        enabled the fused RMSNorm+quant activation scheme may need to follow the
+        downstream weight's online-quant target -- delegated to
+        ``online_quantize_activation``.
+        """
+        # Only the fused-quant path's output depends on `quant_type`; a plain
+        # RMSNorm emits BF16 regardless, so nothing to realign.
+        if self.use_fused_quant:
+            self.online_quantize_activation()
+
+    def online_quantize_activation(self):
+        """Realign the fused RMSNorm activation quant scheme with online quant.
+
+        The fused RMSNorm+quant path emits a quantized activation that a
+        downstream Linear consumes directly without re-quantizing (e.g.
+        DeepSeek-V4 ``q_norm`` -> ``attn.wq_b`` / ``indexer.wq_b``). The GEMM
+        interprets that activation's dtype/scale layout according to the
+        *weight*'s quant scheme. So when online quantization re-quantizes the
+        consumer's weight to a new scheme (e.g. mxfp4 = per_1x32 + fp4x2), the
+        activation emitted here MUST switch to the same scheme; otherwise the
+        per_1x32 GEMM bit-reinterprets a per_1x128 fp8 activation via
+        ``view(fp4x2)`` / ``view(e8m0)`` and produces garbage.
+
+        Mirrors ``LinearBase.online_quantize_weight``'s quant-state update, but
+        there is no weight to re-quantize here -- only the emitted activation
+        ``quant_type`` / ``params_dtype`` (and the derived scale layout).
+        """
+        if self.quant_config is None or not self.quant_config.online_quant:
+            return
+
+        online_cfg = self.quant_config.get_layer_quant_config(
+            self.prefix, use_online_quant=True
+        )
+        online_quant_type = online_cfg.quant_type
+        # Skip if excluded (No) or already emitting the target scheme.
+        if should_skip_online_quant(self.quant_type, self.params_dtype, online_cfg):
+            return
+        # The fused RMSNorm+quant HIP kernel only emits these activation schemes.
+        assert online_quant_type.value in _AITER_RMS_QUANT_TYPE_VALUES, (
+            f"Unsupported online activation quant for fused RMSNorm: "
+            f"type={online_quant_type}, dtype={online_cfg.quant_dtype} "
+            f"(layer={self.prefix})"
+        )
+
+        self.quant_type = online_quant_type
+        self.params_dtype = online_cfg.quant_dtype
+        self._aiter_transpose_scale = (
+            self.quant_type.value == _QV_PER_1X128
+            and envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+        )
+        # Surfaced by the loader's online-quant report alongside Linear layers.
+        self._online_quant_info = {
+            "layer": self.prefix,
+            "quant_type": online_quant_type.name,
+            "quant_dtype": str(online_cfg.quant_dtype),
+            "kind": "rmsnorm_activation",
+        }
 
     @mark_trace(prefix="rmsnorm", torch_compile=True)
     def forward(
@@ -689,6 +755,53 @@ class GemmaRMSNorm(nn.Module):
         if self.use_fused_quant:
             return self._forward_fused_fp8(x, residual)
         return self.forward_cuda(x, residual)
+
+
+def fused_allreduce_gemma_rms_norm(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm: GemmaRMSNorm,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """MiniMax-M3 helper for delayed TP all-reduce followed by Gemma RMSNorm."""
+    if get_tensor_model_parallel_world_size() > 1:
+        return tensor_model_parallel_fused_allreduce_rmsnorm(
+            hidden_states.contiguous(),
+            residual,
+            norm.weight,
+            norm.variance_epsilon,
+            gemma_norm=True,
+        )
+    return norm(hidden_states, residual)
+
+
+def fused_allreduce_gemma_rms_norm_quant(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm: GemmaRMSNorm,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """MiniMax-M3 helper for AR + Gemma RMSNorm + per-token FP8 quant."""
+    if get_tensor_model_parallel_world_size() > 1:
+        out_fp8, residual_out, scale_out = (
+            tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+                hidden_states.contiguous(),
+                residual,
+                norm.weight,
+                norm.variance_epsilon,
+                quant_type="per_token",
+                gemma_norm=True,
+            )
+        )
+        return out_fp8, scale_out, residual_out
+
+    from aiter import get_hip_quant
+    from aiter.utility.dtypes import fp8
+
+    normed, residual_out = norm(hidden_states, residual)
+    out_fp8, scale_out = get_hip_quant(QuantType.per_Token)(
+        normed,
+        quant_dtype=fp8,
+    )
+    return out_fp8, scale_out, residual_out
 
 
 # ---------------------------------------------------------------------------

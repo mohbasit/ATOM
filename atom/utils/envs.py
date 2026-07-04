@@ -34,7 +34,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),
     "ATOM_USE_TRITON_MLA": lambda: os.getenv("ATOM_USE_TRITON_MLA", "0") == "1",
+    # Use the block_size=64 *shuffled* KV-cache Triton/Gluon MLA kernels
+    # (aiter.ops.triton.attention.mla.mla_decode_fwd + the shuffled cat/cache
+    # write kernels) instead of the SGLang-style page_size=1 decode path.
+    # Requires ATOM_USE_TRITON_MLA=1 (selects TritonMLABackend).
+    "ATOM_USE_TRITON_MLA_SHUFFLE_KV": lambda: (
+        os.getenv("ATOM_USE_TRITON_MLA_SHUFFLE_KV", "0") == "1"
+    ),
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
+    "ATOM_MLA_PAGE_SIZE": lambda: int(os.getenv("ATOM_MLA_PAGE_SIZE", "1")),
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
     # flydsl drop-in for V4-Pro Compressor (Main BF16 + Indexer FP8) paths.
@@ -65,6 +73,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION": lambda: (
         os.getenv("ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION", "1") == "1"
     ),
+    # Replicate the EAGLE3 draft vocab embedding on every TP rank (full table per
+    # rank, local lookup) instead of sharding it — eliminates the post-embedding
+    # all-reduce. The draft embed is independent of the (sharded) lm_head.
+    "ATOM_EAGLE_REPLICATE_EMBED": lambda: (
+        os.getenv("ATOM_EAGLE_REPLICATE_EMBED", "1") == "1"
+    ),
     "ATOM_ENABLE_GDN_DECODE_LOSSY_FAST": lambda: (
         os.getenv("ATOM_ENABLE_GDN_DECODE_LOSSY_FAST", "0").lower() == "1"
     ),
@@ -77,6 +91,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --- Profiling & Logging ---
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
+    "ATOM_PROFILER_TIMEOUT": lambda: float(os.getenv("ATOM_PROFILER_TIMEOUT", "300")),
     "ATOM_LOG_MORE": lambda: int(os.getenv("ATOM_LOG_MORE", "0")) != 0,
     # RTL (rocm-trace-lite) GPU kernel tracing — set to output directory to enable.
     # When set, the server launch is wrapped with `rtl trace` to collect per-kernel
@@ -95,9 +110,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use unified_attention (flash-style) for MHA paged/prefill attention instead
     # of pa_decode_gluon. Set to 1 to enable the unified_attention path.
     "ATOM_USE_UNIFIED_ATTN": lambda: os.getenv("ATOM_USE_UNIFIED_ATTN", "0") == "1",
-    # Force the Triton path for V4 sparse-paged-prefill attention; default backend
-    # is aiter's OPUS kernel (gfx950 fast path). Set to 1 to fall back to Triton
-    # (e.g. for debugging or on non-gfx950 builds).
+    # Force Triton attention fallbacks where available. Set to 1 to bypass
+    # optional ASM/OPUS fast paths during debugging.
     "ATOM_FORCE_ATTN_TRITON": lambda: (os.getenv("ATOM_FORCE_ATTN_TRITON", "0") == "1"),
     # Use gluon pa decode for some models
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
@@ -122,6 +136,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: (
         os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower() == "1"
+    ),
+    # --- Atomesh ---
+    # Build atomesh when installing ATOM from source.
+    "ATOM_MESH_BUILD": lambda: os.getenv("ATOM_MESH_BUILD", "0") == "1",
+    # Route the OpenAI-compatible server entrypoint through Atomesh.
+    "USE_ATOMESH_ENTRYPOINTS": lambda: (
+        os.getenv("USE_ATOMESH_ENTRYPOINTS", "0") == "1"
     ),
     # --- Gradient Control ---
     # Enable gradient tracking on model parameters.  Default "0" (disabled)
@@ -208,6 +229,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
         None
         if os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK", "") == ""
         else float(os.getenv("ATOM_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK"))
+    ),
+    # --- TBO prefill ubatch splitting ---
+    # Split prefill ubatches at the exact token midpoint (vLLM-DBO style),
+    # cutting through a request if needed for perfectly balanced 50/50 ubatches.
+    # Default on; set "0" to fall back to the request-boundary balanced split.
+    "ATOM_TBO_PREFILL_TOKEN_SPLIT": lambda: (
+        os.getenv("ATOM_TBO_PREFILL_TOKEN_SPLIT", "1") == "1"
+    ),
+    # --- NUMA binding ---
+    # Master switch: pin each GPU worker to its GPU-local NUMA node's CPU cores
+    # and preferred memory. Default off so baseline/pinned A/B stays clean.
+    "ATOM_NUMA_BIND": lambda: os.getenv("ATOM_NUMA_BIND", "0") == "1",
+    # Auto-detect the GPU->NUMA-node mapping (amdsmi first, sysfs fallback).
+    # Default on, so `ATOM_NUMA_BIND=1` alone is zero-config.
+    "ATOM_AUTO_NUMA_BIND": lambda: os.getenv("ATOM_AUTO_NUMA_BIND", "1") == "1",
+    # Explicit per-global-rank node ids (comma separated), overriding auto, e.g.
+    # ATOM_NUMA_NODE="0,0,0,0,1,1,1,1". A single value applies to all ranks.
+    "ATOM_NUMA_NODE": lambda: os.getenv("ATOM_NUMA_NODE", ""),
+    # Raise instead of warn when binding fails.
+    "ATOM_CRASH_ON_NUMA_BIND_FAILURE": lambda: (
+        os.getenv("ATOM_CRASH_ON_NUMA_BIND_FAILURE", "0") == "1"
     ),
 }
 

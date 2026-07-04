@@ -25,9 +25,11 @@ support_eagle_model_arch_dict = {
     "DeepSeekMTPModel": "atom.models.deepseek_mtp.DeepSeekMTP",
     "DeepseekV4MTPModel": "atom.models.deepseek_v4_mtp.DeepseekV4MTP",
     "Qwen3NextMTPModel": "atom.models.qwen3_next_mtp.Qwen3NextMTP",
-    "MiMoV2FlashMTPModel": "atom.models.mimo_v2_flash_mtp.MiMoV2FlashMTP",
+    "MiMoV2MTPModel": "atom.models.mimo_v2_mtp.MiMoV2MTP",
+    "MiMoV2FlashMTPModel": "atom.models.mimo_v2_mtp.MiMoV2MTP",
     "Qwen3_5MTPModel": "atom.models.qwen3_5_mtp.Qwen3_5MTP",
     "Eagle3LlamaModel": "atom.models.eagle3_llama.Eagle3LlamaModel",
+    "Eagle3DeepseekMLAModel": "atom.models.eagle3_deepseek_mla.Eagle3DeepseekMLAModel",
 }
 
 
@@ -157,6 +159,43 @@ class Eagle3DraftBuilder:
             v_scale=getattr(module, "v_scale", None),
         )
 
+    def get_kv_transfer_tensors(self) -> list:
+        from atom.kv_transfer.disaggregation.types import KVTransferRegion
+
+        runner = self.model_runner
+        if not hasattr(runner, "eagle3_kv_cache"):
+            return []
+
+        regions: list[KVTransferRegion] = []
+        cache = runner.eagle3_kv_cache
+        for layer_id in range(self.num_layers):
+            for kv in range(2):
+                t = cache[kv, layer_id]
+                regions.append(
+                    KVTransferRegion(
+                        base_addr=t.data_ptr(),
+                        total_bytes=t.numel() * t.element_size(),
+                        unit_bytes=t.stride(0) * t.element_size(),
+                    )
+                )
+        scale = runner.eagle3_kv_scale
+        if (
+            self.model_runner.config.kv_cache_dtype == "fp8"
+            and scale is not None
+            and scale.numel() > 0
+        ):
+            for layer_id in range(self.num_layers):
+                for kv in range(2):
+                    t = scale[kv, layer_id]
+                    regions.append(
+                        KVTransferRegion(
+                            base_addr=t.data_ptr(),
+                            total_bytes=t.numel() * t.element_size(),
+                            unit_bytes=t.stride(0) * t.element_size(),
+                        )
+                    )
+        return regions
+
 
 class EagleProposer:
 
@@ -188,12 +227,19 @@ class EagleProposer:
         model_class = resolve_obj_by_qualname(support_eagle_model_arch_dict[draft_model_hf_config.architectures[0]])  # type: ignore
 
         if self.speculative_config.method == "eagle3":
-            # Eagle3 draft model has its own architecture (Llama, not MLA),
-            # so it must be constructed with the draft model's hf_config.
-            # Also disable torch.compile for the draft model to avoid
+            # Eagle3 draft has its own architecture, so build it from the
+            # draft hf_config. Disable torch.compile for the draft to avoid
             # Dynamo tracing issues with the separate KV cache binding.
-            draft_atom_config = copy.deepcopy(atom_config)
+            # Shallow-copy instead of deepcopy: with MLA targets (K2.6), the
+            # atom_config holds non-picklable cuda.Stream objects under
+            # downstream fields that deepcopy can't traverse. We only mutate
+            # hf_config and compilation_config.level on the draft, so
+            # isolating just those two attrs is sufficient.
+            draft_atom_config = copy.copy(atom_config)
             draft_atom_config.hf_config = draft_model_hf_config
+            draft_atom_config.compilation_config = copy.copy(
+                atom_config.compilation_config
+            )
             draft_atom_config.compilation_config.level = CompilationLevel.NO_COMPILATION
             # Draft attention layer_num must continue from the target model's
             # layer count so it maps to the correct kv_cache_data entry.
@@ -201,15 +247,20 @@ class EagleProposer:
                 draft_atom_config,
                 layer_offset=atom_config.hf_config.num_hidden_layers,
             )
-            # Attach the draft's KV-cache builder to the runner. ModelRunner
-            # consults `runner.eagle3_draft_builder` from `_compute_block_bytes`
-            # / `allocate_kv_cache` to size + allocate + bind the draft's
-            # independent non-MLA cache through the standard builder protocol.
-            runner.eagle3_draft_builder = Eagle3DraftBuilder(
-                runner, draft_model_hf_config
-            )
+            # MHA draft (e.g. K2.5 LlamaForCausalLMEagle3): owns an independent
+            # non-MLA KV cache via Eagle3DraftBuilder, attached to the runner.
+            # MLA draft (e.g. K2.6 EAGLE 3.1): same MLA shape as target, so
+            # it piggybacks on the target's MLA pool (model_runner accounts
+            # for the +1 draft layer via num_nextn_predict_layers default).
+            draft_is_mla = bool(getattr(draft_model_hf_config, "kv_lora_rank", None))
+            if not draft_is_mla:
+                runner.eagle3_draft_builder = Eagle3DraftBuilder(
+                    runner, draft_model_hf_config
+                )
         else:
             self.model = model_class(self.config)
+
+        self._draft_argmax_fused = hasattr(self.model, "compute_draft_token")
 
         i32_kwargs = {"dtype": torch.int32, "device": self.device}
         i64_kwargs = {"dtype": torch.int64, "device": self.device}
@@ -239,8 +290,6 @@ class EagleProposer:
 
     def load_model(self, target_model: nn.Module) -> None:
         if self.speculative_config.method == "eagle3":
-            # Eagle3: load from a separate draft model checkpoint with
-            # independent embed_tokens and lm_head (no sharing).
             load_model(
                 self.model,
                 self.speculative_config.model,
@@ -403,8 +452,13 @@ class EagleProposer:
                     if i == 0
                     else ret_hidden_states
                 )
-                logits = self.model.compute_logits(sample_hidden_states)
-                new_draft_ids = logits.argmax(dim=-1)
+                # Distributed argmax (all-gather [N, 2] not [N, vocab]) when the
+                # draft supports it; token-identical to compute_logits().argmax().
+                if self._draft_argmax_fused:
+                    new_draft_ids = self.model.compute_draft_token(sample_hidden_states)
+                else:
+                    logits = self.model.compute_logits(sample_hidden_states)
+                    new_draft_ids = logits.argmax(dim=-1)
                 draft_token_ids[:, i] = new_draft_ids
 
                 if i < self.mtp_k - 1:
@@ -459,10 +513,20 @@ class EagleProposer:
 
                     # update metadata
                     attn_metadata.max_seqlen_k += 1
-                    # Update context_lens for each draft step (needed by both
-                    # MHA attention and MLA+sparse indexer)
-                    attn_metadata.context_lens[:bs] += 1
-                    positions += 1
+                    fuse_mtp = positions.ndim == 1 and getattr(
+                        self.runner.attn_metadata_builder,
+                        "fuse_mtp_decode_position_update",
+                        False,
+                    )
+                    if fuse_mtp:
+                        mtp_decode_kwargs = {
+                            "update_context_lens": True,
+                            "positions_out": positions,
+                        }
+                    else:
+                        attn_metadata.context_lens[:bs] += 1
+                        positions += 1
+                        mtp_decode_kwargs = {}
                     workinfos = self.runner.attn_metadata_builder.prepare_mtp_decode(
                         bs,
                         (
@@ -474,10 +538,11 @@ class EagleProposer:
                         positions,
                         only_update=do_attn_metadata_update,
                         num_reject_tokens=num_reject_tokens if i == 0 else None,
+                        **mtp_decode_kwargs,
                     )
                     for k, v in workinfos.items():
                         attn_metadata.__dict__[k] = v
-                    if has_flat_kv:
+                    if has_flat_kv and "slot_mapping" not in workinfos:
                         # MLA/MHA path: slot derived from flat kv_indices.
                         slot_mapping[:] = kv_indices[kv_indptr[1 : bs + 1] - 1]
 

@@ -30,6 +30,7 @@ class EngineArgs:
     model: str = "Qwen/Qwen3-0.6B"
     trust_remote_code: bool = False
     tensor_parallel_size: int = 1
+    prefill_context_parallel_size: int = 1
     data_parallel_size: int = 1
     enforce_eager: bool = False
     enable_prefix_caching: bool = True
@@ -38,6 +39,7 @@ class EngineArgs:
     block_size: int = 16
     max_model_len: Optional[int] = None
     max_num_batched_tokens: int = 16384
+    long_prefill_token_threshold: int = 0
     attn_prefill_chunk_size: int = 16384
     enable_chunked_prefill: bool = True
     scheduler_delay_factor: float = 0.0
@@ -57,6 +59,7 @@ class EngineArgs:
     draft_model: Optional[str] = None
     mark_trace: bool = False
     online_quant_config: Optional[dict] = None
+    hf_overrides: Optional[dict] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -76,6 +79,14 @@ class EngineArgs:
             type=int,
             default=1,
             help="Tensor parallel size.",
+        )
+        parser.add_argument(
+            "--prefill-context-parallel-size",
+            "-pcp",
+            type=int,
+            default=1,
+            help="Prefill context parallel size. Independent dimension "
+            "(world = tp x pcp); splits the sequence during prefill.",
         )
         parser.add_argument(
             "--data-parallel-size",
@@ -192,6 +203,17 @@ class EngineArgs:
             help="Maximum number of tokens to batch together in async engine",
         )
         parser.add_argument(
+            "--long-prefill-token-threshold",
+            type=int,
+            default=0,
+            help=(
+                "For chunked prefill, cap a single request's per-step prefill "
+                "size at this many tokens. 0 disables the cap (request is only "
+                "bounded by max_num_batched_tokens). Useful to interleave long "
+                "prefills with decode for lower ITL."
+            ),
+        )
+        parser.add_argument(
             "--attn-prefill-chunk-size",
             type=int,
             default=16384,
@@ -259,6 +281,16 @@ class EngineArgs:
                 """  '{"global_quant_config": "ptpc_fp8", """
                 """"layer_quant_config": {"*expert*": "mxfp4"}, """
                 """"exclude_layer": "lm_head"}'"""
+            ),
+        )
+        parser.add_argument(
+            "--hf-overrides",
+            type=json.loads,
+            default=None,
+            help=(
+                "JSON object of HF config attributes to override after loading "
+                "the model config. Example: "
+                '\'{"use_index_cache": true, "index_topk_freq": 4}\''
             ),
         )
 

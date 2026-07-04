@@ -1,5 +1,3 @@
-from collections.abc import Iterable
-
 import numpy as np
 import torch
 from torch import nn
@@ -7,15 +5,17 @@ from torch import nn
 
 from atom.config import QuantizationConfig, Config
 
-from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from atom.model_ops.utils import atom_parameter
 from atom.utils.decorators import support_torch_compile
 
 from atom.model_ops.embed_head import VocabParallelEmbedding, ParallelLMHead
-from atom.model_config.qwen3_5 import Qwen3_5Config, Qwen3_5TextConfig
+from atom.model_config.qwen3_5 import (
+    Qwen3_5Config,  # noqa: F401
+    Qwen3_5TextConfig,
+)
 
 from atom.model_config.qwen3_5_moe import (
-    Qwen3_5MoeConfig,
+    Qwen3_5MoeConfig,  # noqa: F401
     Qwen3_5MoeTextConfig,
 )
 from atom.model_ops.moe import FusedMoE
@@ -533,11 +533,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts
-            + (
-                self.config.n_shared_experts
-                if is_rocm_aiter_fusion_shared_expert_enabled()
-                else 0
-            ),
+            + (self.config.n_shared_experts or 0),
         )
 
 

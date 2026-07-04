@@ -14,7 +14,7 @@ import torch
 import zmq
 from atom.config import Config, ParallelConfig
 from atom.model_engine.async_proc import AsyncIOProcManager
-from atom.rollout.engine_utility import EngineUtilityHandler
+from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence, SequenceStatus, get_exit_sequence
 from atom.utils import envs, init_exit_handler, make_zmq_socket
@@ -92,9 +92,13 @@ class EngineCore:
         # Initialize model runner processes
         try:
             good = False
+            # Number of worker processes = full model-parallel world size.
+            # PCP is an independent dimension (world = tp x pcp), so spawn
+            # tp x pcp workers; otherwise init_dist_env (which expects a world
+            # of tp x pcp) would hang waiting for the PCP ranks.
             self.runner_mgr = AsyncIOProcManager(
                 self._finalizer,
-                config.tensor_parallel_size,
+                config.tensor_parallel_size * config.prefill_context_parallel_size,
                 config.runner_qualname,
                 config,
             )
@@ -137,7 +141,10 @@ class EngineCore:
             )
 
         self.utility_handler = EngineUtilityHandler(
-            self.runner_mgr, self.output_queue, label=self.label
+            self.runner_mgr,
+            self.output_queue,
+            label=self.label,
+            scheduler=self.scheduler,
         )
 
         self._send_ready_signal()
@@ -248,21 +255,13 @@ class EngineCore:
             self.output_queue.put_nowait(rejected)
 
         if result is None:
-            if self.kv_transfer_enabled:
-                kvoutput = self.runner_mgr.call_func_with_aggregation(
-                    "async_proc_aggregation"
-                )
-                self.scheduler._update_from_kv_xfer_finished(kvoutput)
+            self._advance_idle_kv_transfer()
             return False
         scheduled_batch, seqs = result
 
         if scheduled_batch is None:
             logger.debug("%s: No sequences to schedule, skipping forward", self.label)
-            if self.kv_transfer_enabled:
-                kvoutput = self.runner_mgr.call_func_with_aggregation(
-                    "async_proc_aggregation"
-                )
-                self.scheduler._update_from_kv_xfer_finished(kvoutput)
+            self._advance_idle_kv_transfer()
             return False
 
         # Dispatch KV connector metadata to workers (triggers async KV load)
@@ -283,11 +282,7 @@ class EngineCore:
             )
 
         # Aggregate KV transfer status from all workers (only when PD disaggregation is active)
-        if self.kv_transfer_enabled:
-            kvoutput = self.runner_mgr.call_func_with_aggregation(
-                "async_proc_aggregation"
-            )
-            self.scheduler._update_from_kv_xfer_finished(kvoutput)
+        self._poll_kv_transfer_progress()
 
         if not has_seqs:
             logger.debug("%s: Empty scheduled batch, skipping postprocess", self.label)
@@ -315,6 +310,29 @@ class EngineCore:
             self.output_queue.put_nowait(finished_seqs)
 
         return True
+
+    def _advance_idle_kv_transfer(self) -> None:
+        # No forward batch will run this tick, but offload load/save work may
+        # still need to be dispatched or reported back to the scheduler.
+        self._dispatch_idle_offload_work()
+        self._poll_kv_transfer_progress()
+
+    def _poll_kv_transfer_progress(self) -> None:
+        if not self.kv_transfer_enabled:
+            return
+        kvoutput = self.runner_mgr.call_func_with_aggregation("async_proc_aggregation")
+        self.scheduler._update_from_kv_xfer_finished(kvoutput)
+
+    def _dispatch_idle_offload_work(self) -> None:
+        if not self.kv_transfer_enabled:
+            return
+        connector = getattr(self.scheduler, "kv_connector", None)
+        if connector is None or not getattr(connector, "is_offload", False):
+            return
+        meta = connector.build_connector_meta()
+        if meta is None or not getattr(meta, "requests", None):
+            return
+        self.runner_mgr.call_func("process_kvconnector_output", meta)
 
     def pull_and_process_input_queue(self):
         recv_reqs = []
@@ -357,20 +375,10 @@ class EngineCore:
                         )
                         self.input_queue.put_nowait(reqs)
                     elif request_type == EngineCoreRequestType.UTILITY:
-                        # Put utility commands into queue for processing in busy_loop
-                        # This ensures all runner_mgr.call_func() calls happen in the same thread
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
                         logger.debug(f"{self.label}: input get UTILITY command: {cmd}")
-                        if cmd == "start_profile":
-                            self.start_profiler()
-                        elif cmd == "stop_profile":
-                            self.stop_profiler()
-                        elif cmd == "get_mtp_stats":
-                            self.print_mtp_statistics()
-                        else:
-                            # Queue command for processing in busy_loop (main thread)
-                            self.utility_queue.put_nowait((cmd, reqs))
-                            self._has_pending_utility = True
+                        self.utility_queue.put_nowait((cmd, reqs))
+                        self._has_pending_utility = True
                     elif request_type == EngineCoreRequestType.SHUTDOWN:
                         logger.debug(f"{self.label}: input get {request_type}")
                         self.input_queue.put_nowait([get_exit_sequence()])

@@ -68,6 +68,7 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    use_fp4_non_shuffle_triton_gemm,
     use_triton_gemm,
 )
 from atom.model_ops.moe import FusedMoE
@@ -136,6 +137,32 @@ _FP8_DTYPES = tuple(
 )
 
 
+def _enable_non_triton_global_mxfp4_input_norm_quant(
+    config: PretrainedConfig,
+    quant_config: Optional[QuantizationConfig],
+    quant_dtype: Optional[torch.dtype],
+    is_mtp_block: bool,
+) -> bool:
+    if (
+        is_mtp_block
+        or quant_dtype != dtypes.fp4x2
+        or quant_config is None
+        or quant_config.quant_method != "quark"
+        or quant_config.quant_dtype != dtypes.fp4x2
+        or quant_config.layer_pattern_specs
+    ):
+        return False
+    architectures = set(getattr(config, "architectures", None) or [])
+    return bool(
+        architectures & {"DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"}
+    ) or str(getattr(config, "model_type", "")).lower() in {
+        "deepseek_v2",
+        "deepseek_v3",
+        "deepseek_v32",
+        "deepseek_v4",
+    }
+
+
 def _supports_fused_indexer_kernel_config(config: PretrainedConfig) -> bool:
     if not hasattr(config, "index_topk"):
         return False
@@ -145,6 +172,15 @@ def _supports_fused_indexer_kernel_config(config: PretrainedConfig) -> bool:
         getattr(config, "index_head_dim", None) == 128
         and getattr(config, "qk_rope_head_dim", None) == 64
     )
+
+
+def _is_neox_rope_style(
+    config: PretrainedConfig, interleave_attr: str, default_interleave: bool
+) -> bool:
+    interleave = getattr(config, interleave_attr, default_interleave)
+    if interleave is None:
+        interleave = default_interleave
+    return not bool(interleave)
 
 
 def _can_fuse_indexer_wk_weights_proj(
@@ -167,6 +203,68 @@ def _can_fuse_indexer_wk_weights_proj(
         ):
             return False
     return True
+
+
+def _extract_layer_index_from_prefix(prefix: str) -> int:
+    for part in reversed(prefix.split(".")):
+        if part.isdigit():
+            return int(part)
+    return 0
+
+
+def _should_skip_index_topk(config: PretrainedConfig, prefix: str) -> bool:
+    if not getattr(config, "use_index_cache", False):
+        # IndexShare (e.g. GLM-5.2): index_topk_freq > 1 shares the indexer across
+        # layers, so enable the cache even if the config omits the flag; otherwise
+        # there is nothing to skip.
+        if int(getattr(config, "index_topk_freq", 1)) > 1:
+            config.use_index_cache = True
+        else:
+            return False
+
+    layer_id = _extract_layer_index_from_prefix(prefix)
+
+    # GLM-5.2 MTP layer (index >= num_hidden_layers): the MTP block ships its
+    # OWN indexer weights and computes its own top-k for the drafted position,
+    # so do not skip it. `index_share_for_mtp_iteration` only concerns sharing
+    # across MULTIPLE MTP draft steps (num_speculative_tokens>1); it does NOT
+    # mean the MTP reuses the target model's index. Matches vLLM upstream and
+    # the ATOM sglang plugin, which both run the MTP indexer independently.
+    num_hidden_layers = getattr(config, "num_hidden_layers", None)
+    if num_hidden_layers is not None and layer_id >= num_hidden_layers:
+        return False
+
+    # GLM-5.2 IndexShare: per-layer schedule, "shared" reuses the prior "full"
+    # layer's topk. Authoritative when present; else fall back to pattern/freq.
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is not None:
+        return (
+            0 <= layer_id < len(indexer_types) and indexer_types[layer_id] == "shared"
+        )
+
+    index_topk_pattern = getattr(config, "index_topk_pattern", None)
+    if index_topk_pattern is not None:
+        return (
+            0 <= layer_id < len(index_topk_pattern)
+            and index_topk_pattern[layer_id] == "S"
+        )
+
+    index_topk_freq = int(getattr(config, "index_topk_freq", 1))
+    if index_topk_freq <= 0:
+        raise ValueError("index_topk_freq must be a positive integer")
+    # offset defaults to 1 = prior `layer_id - 1` behavior for DeepSeek configs.
+    offset = int(getattr(config, "index_skip_topk_offset", 1))
+    return max(layer_id - offset, 0) % index_topk_freq != 0
+
+
+def _indexer_weights_shared(config: PretrainedConfig, prefix: str) -> bool:
+    """GLM-5.2 IndexShare: "shared" layers carry no indexer weights (they reuse
+    the prior "full" layer), so don't build params for them. DeepSeek: per-layer."""
+    indexer_types = getattr(config, "indexer_types", None)
+    if indexer_types is None:
+        return False
+    layer_id = _extract_layer_index_from_prefix(prefix)
+    return 0 <= layer_id < len(indexer_types) and indexer_types[layer_id] == "shared"
 
 
 def _fuse_rmsnorm_fp4_quant_fake(
@@ -194,8 +292,12 @@ def _fuse_rmsnorm_fp4_quant_fake(
 
     scale_n_valid = (n1 + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
 
-    scale_m = ((m + 255) // 256) * 256
-    scale_n = ((scale_n_valid + 7) // 8) * 8
+    if scale_shuffle_padding:
+        scale_m = ((m + 255) // 256) * 256
+        scale_n = ((scale_n_valid + 7) // 8) * 8
+    else:
+        scale_m = m
+        scale_n = scale_n_valid
 
     out1_bs = torch.empty((scale_m, scale_n), dtype=torch.uint8, device=x1.device)
 
@@ -209,6 +311,15 @@ def _fuse_rmsnorm_fp4_quant_fake(
 
     out1_unquantized = None
     return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
+
+
+def _mxfp4_activation_quant_layout(num_tokens: int) -> Tuple[bool, bool]:
+    if use_fp4_non_shuffle_triton_gemm():
+        return False, False
+    if use_triton_gemm():
+        should_shuffle = num_tokens >= MXFP4_QUANT_BLOCK_SIZE
+        return should_shuffle, should_shuffle
+    return True, True
 
 
 def _fused_rms_fp8_quant_fake(
@@ -274,10 +385,6 @@ def _fuse_rmsnorm_fp4_quant(
     torch.Tensor,
     torch.Tensor,
 ]:
-    m = x1.shape[0]
-
-    shuffle_bool = shuffle and (m >= MXFP4_QUANT_BLOCK_SIZE)
-
     (out1_quantized, out1_bs), _out1_unquantized, out2, out_res1 = (
         fused_rms_mxfp4_quant(
             x1=x1,
@@ -287,7 +394,7 @@ def _fuse_rmsnorm_fp4_quant(
             x2_weight=x2_weight,
             x2_epsilon=0.0 if x2_epsilon is None else x2_epsilon,
             res1=res1,
-            shuffle=shuffle_bool,
+            shuffle=shuffle,
             scale_shuffle_padding=scale_shuffle_padding,
             output_unquantized_inp1=output_unquantized_inp1,
         )
@@ -436,8 +543,12 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4_fake(
     device = hidden_states_quant.device
     q_c = torch.empty((M, q_lora_rank // 2), dtype=torch.uint8, device=device)
     scale_n_valid = (q_lora_rank + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
-    scale_m = ((M + 255) // 256) * 256
-    scale_n = ((scale_n_valid + 7) // 8) * 8
+    if scale_shuffle_padding:
+        scale_m = ((M + 255) // 256) * 256
+        scale_n = ((scale_n_valid + 7) // 8) * 8
+    else:
+        scale_m = M
+        scale_n = scale_n_valid
     q_c_scale = torch.empty((scale_m, scale_n), dtype=torch.uint8, device=device)
     kv_c_normed = torch.empty((M, kv_lora_rank), dtype=torch.bfloat16, device=device)
     k_pe = torch.empty(
@@ -621,6 +732,12 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp8(
     transpose_scale: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     M = hidden_states_quant.shape[0]
+
+    # NOTE: this fused path always calls aiter's *preshuffle* blockscale GEMMs,
+    # which require a 16x16-shuffled weight. fused_qkv_a_proj is flagged with
+    # needs_preshuffled_weight=True so the loader shuffles it once even under the
+    # non-preshuffle path (ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0) -- see
+    # LinearBase.process_weights_after_loading.
 
     if hidden_states_quant_scale is None:
         if M <= 32:
@@ -870,9 +987,15 @@ class DeepseekV2MoE(nn.Module):
         self._use_dual_stream = False
         self.alt_stream = alt_stream
         self.prefix = prefix
+        self.is_rocm_aiter_fusion_shared_expert_enabled = (
+            is_rocm_aiter_fusion_shared_expert_enabled(
+                shared_expert_prefix=f"{prefix}.shared_experts",
+                routed_expert_prefix=f"{prefix}.experts",
+            )
+        )
 
         if config.n_shared_experts is not None:
-            if not is_rocm_aiter_fusion_shared_expert_enabled():
+            if not self.is_rocm_aiter_fusion_shared_expert_enabled:
                 tbo_active = get_current_atom_config().enable_tbo
                 if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
                     self._use_dual_stream = True
@@ -945,7 +1068,7 @@ class DeepseekV2MoE(nn.Module):
         shared_output = None
         if (
             self.n_shared_experts is not None
-            and not is_rocm_aiter_fusion_shared_expert_enabled()
+            and not self.is_rocm_aiter_fusion_shared_expert_enabled
         ):
             shared_output = self.shared_experts(hidden_states)
 
@@ -1637,6 +1760,11 @@ class DeepseekV2MLAAttention(nn.Module):
                 source_quant_dtype=source_quant_dtype,
                 prefix=f"{prefix}.fused_qkv_a_proj",
             )
+            # The fused qkv_a_proj forward calls *preshuffle* blockscale GEMMs, so
+            # its weight must be 16x16-shuffled even when the global non-preshuffle
+            # path (ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0) is selected. The loader
+            # honors this flag in LinearBase.process_weights_after_loading.
+            self.fused_qkv_a_proj.needs_preshuffled_weight = True
             self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,
@@ -1714,7 +1842,7 @@ class DeepseekV2MLAAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            is_neox_style=False,
+            is_neox_style=_is_neox_rope_style(config, "rope_interleave", True),
         )
         if rope_scaling:
             mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
@@ -1723,8 +1851,10 @@ class DeepseekV2MLAAttention(nn.Module):
             self.scaling = self.scaling * mscale * mscale
 
         self.is_v32 = hasattr(config, "index_topk")
+        self.skip_topk = False
 
         if self.is_v32:
+            self.skip_topk = _should_skip_index_topk(config, prefix)
             self.indexer_rope_emb = get_rope(
                 qk_rope_head_dim,
                 rotary_dim=qk_rope_head_dim,
@@ -1733,24 +1863,29 @@ class DeepseekV2MLAAttention(nn.Module):
                 rope_scaling=rope_scaling,
                 is_neox_style=True,
             )
-            self.indexer = Indexer(
-                get_current_atom_config(),
-                config,
-                hidden_size,
-                q_lora_rank,
-                base_quant_config,
-                cache_config,
-                (
-                    _can_fuse_indexer_wk_weights_proj(
-                        config,
-                        model_quant_config,
-                        [f"{prefix}.indexer"],
-                    )
-                    if use_indexer_wk_weights_proj_fusion is None
-                    else use_indexer_wk_weights_proj_fusion
-                ),
-                f"{prefix}.indexer",
-            )
+            if _indexer_weights_shared(config, prefix):
+                # GLM-5.2 IndexShare: reuses prior "full" layer's indexer; the
+                # forward and index-cache binding guard on `indexer is not None`.
+                self.indexer = None
+            else:
+                self.indexer = Indexer(
+                    get_current_atom_config(),
+                    config,
+                    hidden_size,
+                    q_lora_rank,
+                    base_quant_config,
+                    cache_config,
+                    (
+                        _can_fuse_indexer_wk_weights_proj(
+                            config,
+                            model_quant_config,
+                            [f"{prefix}.indexer"],
+                        )
+                        if use_indexer_wk_weights_proj_fusion is None
+                        else use_indexer_wk_weights_proj_fusion
+                    ),
+                    f"{prefix}.indexer",
+                )
         else:
             self.indexer_rope_emb = None
             self.indexer = None
@@ -1773,6 +1908,12 @@ class DeepseekV2MLAAttention(nn.Module):
             kv_b_proj=self.kv_b_proj,
             o_proj=self.o_proj,
             indexer=self.indexer,
+            # v3.2 / GLM-5.2 runs sparse MLA on every layer. For GLM-5.2 IndexShare
+            # "shared" layers self.indexer is None, but they must still run sparse
+            # attention and reuse the prior full layer's top-k, so flag sparsity at
+            # the model level rather than per-layer.
+            is_sparse=self.is_v32,
+            topk_tokens=(config.index_topk if self.is_v32 else None),
         )
 
         self.mla_attn = Attention(
@@ -1844,6 +1985,12 @@ class DeepseekV2MLAAttention(nn.Module):
                 )
                 # fuse q_c norm + kv_c norm + quant of hidden_states_or_q_c
                 if self.fuse_qknorm_quant or self.fuse_qknorm:
+                    q_shuffle = False
+                    q_scale_shuffle_padding = False
+                    if self.quant_dtype == dtypes.fp4x2 and not use_triton_gemm():
+                        q_shuffle, q_scale_shuffle_padding = (
+                            _mxfp4_activation_quant_layout(q_c.shape[0])
+                        )
                     (
                         (hidden_states_or_q_c, hidden_states_or_q_c_scale),
                         _,
@@ -1858,8 +2005,8 @@ class DeepseekV2MLAAttention(nn.Module):
                         self.kv_a_layernorm.eps,
                         None,
                         dtype_quant=self.quant_dtype,
-                        shuffle=False,
-                        scale_shuffle_padding=False,
+                        shuffle=q_shuffle,
+                        scale_shuffle_padding=q_scale_shuffle_padding,
                         group_size=128,
                         quant_type=self.qknorm_quant_type,
                         output_unquantized_inp1=False,
@@ -1877,7 +2024,7 @@ class DeepseekV2MLAAttention(nn.Module):
         if not self.fuse_qknorm_quant and not self.fuse_qknorm:
             kv_c_normed = self.kv_a_layernorm(kv_c)
             hidden_states_or_q_c_scale = None
-        if self.is_v32 and self.indexer is not None:
+        if self.is_v32 and self.indexer is not None and not self.skip_topk:
             self.indexer(
                 hidden_states,
                 hidden_states_or_q_c,
@@ -1932,7 +2079,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             use_indexer_wk_weights_proj_fusion=use_indexer_wk_weights_proj_fusion,
         )
 
-        # When ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned on self.fuse_input_norm_quant is turned on only if use_triton_gemm and (FP8 or FP4),
+        # Keep input RMSNorm quant fusion narrow: the legacy FP8/FP4 path uses
+        # Triton GEMM, while the non-Triton FP4 path is only enabled for the
+        # pure global MXFP4 DeepSeek v2 checkpoint layout.
         # Because AR_RMS and RMS_Quant cannot co-exist for input_layernorm, this block of codes ensures 3 things when ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned on:
         #   1. RMS_Quant fusion is only used for input_layernorm
         #   2. The reduce_results variable is re-enabled for feed forward layers (MOE and MLP), because AR_RMS is now disabled in the beginning of the next layer
@@ -1950,9 +2099,19 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.fuse_input_norm_quant = False
         self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION
         if quant_config is not None and ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION:
-            if (
-                self.quant_dtype == dtypes.fp8 or self.quant_dtype == dtypes.fp4x2
-            ) and use_triton_gemm():
+            enable_fp8_input_norm_quant = (
+                self.quant_dtype == dtypes.fp8 and use_triton_gemm()
+            )
+            enable_fp4_input_norm_quant = self.quant_dtype == dtypes.fp4x2 and (
+                use_triton_gemm()
+                or _enable_non_triton_global_mxfp4_input_norm_quant(
+                    config,
+                    quant_config,
+                    self.quant_dtype,
+                    is_mtp_block,
+                )
+            )
+            if enable_fp8_input_norm_quant or enable_fp4_input_norm_quant:
                 self.fuse_input_norm_quant = True
                 if self.fuse_ar_input_norm:
                     self.fuse_ar_input_norm = False
@@ -1960,11 +2119,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                         logger.info(
                             "Warning: Because ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned on, AR + RMS fusion is turned off for input_layernorm and reduce_results is re-enabled for first k dense layer down_proj"
                         )
-            else:
-                if layer_idx == 0:
-                    logger.info(
-                        "Info: Because ATOM_USE_TRITON_GEMM is not turned on in DeepSeek-R1, ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned off automatically"
-                    )
 
         if (
             config.n_routed_experts is not None
@@ -2015,6 +2169,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             assert self.quant_dtype is not None
             weight = self.input_layernorm.weight
             eps = self.input_layernorm.eps
+            if self.quant_dtype == dtypes.fp4x2:
+                shuffle_input_norm_quant, scale_shuffle_padding = (
+                    _mxfp4_activation_quant_layout(hidden_states.shape[0])
+                )
+            else:
+                shuffle_input_norm_quant = True
+                scale_shuffle_padding = True
             if residual is None:
                 residual = hidden_states
                 (hidden_states_quant, hidden_states_quant_scale), _, _, _ = (
@@ -2027,8 +2188,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                         None,
                         None,
                         dtype_quant=self.quant_dtype,
-                        shuffle=True,
-                        scale_shuffle_padding=True,
+                        shuffle=shuffle_input_norm_quant,
+                        scale_shuffle_padding=scale_shuffle_padding,
                         group_size=128,
                         quant_type=self.input_norm_quant_type,
                         output_unquantized_inp1=False,
@@ -2046,8 +2207,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                         None,
                         residual,
                         dtype_quant=self.quant_dtype,
-                        shuffle=True,
-                        scale_shuffle_padding=True,
+                        shuffle=shuffle_input_norm_quant,
+                        scale_shuffle_padding=scale_shuffle_padding,
                         group_size=128,
                         quant_type=self.input_norm_quant_type,
                         output_unquantized_inp1=False,
@@ -2207,11 +2368,7 @@ class DeepseekV2Model(nn.Module):
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
             num_experts=self.config.n_routed_experts
-            + (
-                self.config.n_shared_experts
-                if is_rocm_aiter_fusion_shared_expert_enabled()
-                else 0
-            ),
+            + (self.config.n_shared_experts or 0),
         )
 
 
