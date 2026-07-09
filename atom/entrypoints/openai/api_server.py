@@ -383,6 +383,7 @@ async def generate_async(
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: Optional[Dict[str, Any]] = None,
+    data_parallel_rank: Optional[int] = None,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     """Generate text asynchronously for non-streaming requests."""
     global engine, tokenizer
@@ -427,6 +428,11 @@ async def generate_async(
         )
 
     seq = await loop.run_in_executor(None, do_preprocess)
+    if data_parallel_rank is not None:
+        seq.data_parallel_rank = data_parallel_rank
+        logger.info(
+            "Request %s pinned to data_parallel_rank=%s", seq.id, data_parallel_rank
+        )
     try:
         _validate_sequence_context_length(seq)
     except Exception:
@@ -569,6 +575,7 @@ async def generate_async_fanout(
     request_id: str,
     kv_transfer_params: Optional[Dict[str, Any]] = None,
     multimodal_data: Optional[Dict[str, Any]] = None,
+    data_parallel_rank: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """Non-streaming n>1 path: fan out N siblings and await all of them.
 
@@ -622,6 +629,15 @@ async def generate_async_fanout(
         )
 
     seqs = await loop.run_in_executor(None, do_preprocess)
+    if data_parallel_rank is not None:
+        for seq in seqs:
+            seq.data_parallel_rank = data_parallel_rank
+        logger.info(
+            "Request %s fanout pinned %d sequence(s) to data_parallel_rank=%s",
+            request_id,
+            len(seqs),
+            data_parallel_rank,
+        )
     try:
         _validate_sequence_context_length(seqs[0])
     except Exception:
@@ -1127,6 +1143,7 @@ async def completions(request: CompletionRequest):
                 sampling_params,
                 request_id,
                 kv_transfer_params=request.kv_transfer_params,
+                data_parallel_rank=request.data_parallel_rank,
             )
             if not outputs:
                 raise RuntimeError("No output generated")
@@ -1138,6 +1155,7 @@ async def completions(request: CompletionRequest):
                 sampling_params,
                 request_id,
                 kv_transfer_params=request.kv_transfer_params,
+                data_parallel_rank=request.data_parallel_rank,
             ):
                 final_output = output
 
