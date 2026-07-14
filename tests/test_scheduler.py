@@ -5,6 +5,8 @@
 from collections import deque
 from types import SimpleNamespace
 
+import numpy as np
+
 from atom.model_engine.scheduler import (
     ScheduledBatch,
     Scheduler,
@@ -778,9 +780,10 @@ class TestPrefillBatchGate:
 class TestComputeRooflineAggregates:
     """Unit tests for Scheduler.compute_roofline_aggregates (pure Python).
 
-    The method only touches ``self.profile_active`` and the env var, so a
-    lightweight SimpleNamespace stands in for both the scheduler and the
-    sequences — no GPU or full Scheduler construction required.
+    The method only touches ``self.profile_active`` and the cached
+    ``self._detailed_annotation_enabled`` flag, so a lightweight
+    SimpleNamespace stands in for both the scheduler and the sequences — no
+    GPU or full Scheduler construction required.
     """
 
     @staticmethod
@@ -810,9 +813,10 @@ class TestComputeRooflineAggregates:
             ),
         }
 
-    def test_aggregates_when_enabled(self, monkeypatch):
-        monkeypatch.setenv("ATOM_ENABLE_ROOFLINE_ANNOTATION", "1")
-        fake_self = SimpleNamespace(profile_active=True)
+    def test_aggregates_when_enabled(self):
+        fake_self = SimpleNamespace(
+            profile_active=True, _detailed_annotation_enabled=True
+        )
         batch = self._make_batch([4, 3, 1])
 
         Scheduler.compute_roofline_aggregates(fake_self, batch, self._make_seqs())
@@ -821,9 +825,10 @@ class TestComputeRooflineAggregates:
         assert batch.roofline_sqsk == 24 + 9 + 10
         assert batch.roofline_sk == 6 + 3 + 10
 
-    def test_noop_when_env_disabled(self, monkeypatch):
-        monkeypatch.delenv("ATOM_ENABLE_ROOFLINE_ANNOTATION", raising=False)
-        fake_self = SimpleNamespace(profile_active=True)
+    def test_noop_when_flag_disabled(self):
+        fake_self = SimpleNamespace(
+            profile_active=True, _detailed_annotation_enabled=False
+        )
         batch = self._make_batch([4, 3, 1])
 
         Scheduler.compute_roofline_aggregates(fake_self, batch, self._make_seqs())
@@ -832,11 +837,55 @@ class TestComputeRooflineAggregates:
         assert batch.roofline_sqsk is None
         assert batch.roofline_sk is None
 
-    def test_noop_when_profiling_inactive(self, monkeypatch):
-        monkeypatch.setenv("ATOM_ENABLE_ROOFLINE_ANNOTATION", "1")
-        fake_self = SimpleNamespace(profile_active=False)
+    def test_noop_when_profiling_inactive(self):
+        fake_self = SimpleNamespace(
+            profile_active=False, _detailed_annotation_enabled=True
+        )
         batch = self._make_batch([4, 3, 1])
 
         Scheduler.compute_roofline_aggregates(fake_self, batch, self._make_seqs())
 
         assert batch.roofline_sqsq is None
+        assert batch.roofline_sqsk is None
+        assert batch.roofline_sk is None
+
+    def test_no_int32_overflow_large_prefill(self):
+        # Regression: num_scheduled_tokens is np.int32, so nq*nq must not
+        # overflow for long prefills. np.int32(65536)**2 wraps to 0, which
+        # would silently corrupt the estimate the feature exists to produce.
+        fake_self = SimpleNamespace(
+            profile_active=True, _detailed_annotation_enabled=True
+        )
+        nq = 65536
+        batch = self._make_batch(np.asarray([nq], dtype=np.int32))
+        seqs = {
+            0: SimpleNamespace(
+                type=SequenceType.PREFILL, num_tokens=nq, num_cached_tokens=0
+            )
+        }
+
+        Scheduler.compute_roofline_aggregates(fake_self, batch, seqs)
+
+        assert batch.roofline_sqsq == nq * nq  # 4294967296, not 0
+        assert batch.roofline_sqsk == nq * nq
+        assert batch.roofline_sk == nq
+        assert isinstance(batch.roofline_sqsq, int)
+
+    def test_decode_counts_scheduled_query_tokens(self):
+        # MTP/spec-decode schedules mtp_k+1 query tokens; nq must reflect the
+        # scheduled count rather than a hardcoded 1 (otherwise undercounted).
+        fake_self = SimpleNamespace(
+            profile_active=True, _detailed_annotation_enabled=True
+        )
+        batch = self._make_batch(np.asarray([3], dtype=np.int32))
+        seqs = {
+            0: SimpleNamespace(
+                type=SequenceType.DECODE, num_tokens=100, num_cached_tokens=97
+            )
+        }
+
+        Scheduler.compute_roofline_aggregates(fake_self, batch, seqs)
+
+        assert batch.roofline_sqsq == 9  # 3^2
+        assert batch.roofline_sqsk == 300  # 3 * 100
+        assert batch.roofline_sk == 100

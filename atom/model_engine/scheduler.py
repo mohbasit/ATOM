@@ -340,7 +340,7 @@ class ScheduledBatch:
         self.num_spec_step = num_spec_step
 
         # Roofline FLOP aggregates (set by Scheduler.compute_roofline_aggregates
-        # when profiling is active and ATOM_ENABLE_ROOFLINE_ANNOTATION is set).
+        # when profiling is active and ATOM_ENABLE_DETAILED_ANNOTATION is set).
         # None on the normal path; consumed by ModelRunner.run_model to extend
         # the prefill[]/decode[] trace labels.
         self.roofline_sqsq: int | None = None  # sum N_Q^2
@@ -469,6 +469,9 @@ class Scheduler:
             CacheStats() if config.enable_prefix_caching else None
         )
         self.profile_active = False
+        # Cache the env flag once (env vars are fixed at process start) so the
+        # per-iteration compute_roofline_aggregates never pays an os.getenv.
+        self._detailed_annotation_enabled = envs.ATOM_ENABLE_DETAILED_ANNOTATION
 
         self.enable_chunked_prefill = config.enable_chunked_prefill
         # V4 SWA correctness on a prefix-cache hit. V4's sliding-window state is
@@ -1696,12 +1699,15 @@ class Scheduler:
         ``N_KV`` is its KV length (cached + new tokens for prefill, full
         sequence length for decode). Aggregating over every request in the
         batch gives the total for that single forward, which is exactly the
-        quantity a per-iteration roofline point needs.
+        quantity a per-iteration roofline point needs. For MTP/spec-decode a
+        decode step schedules ``mtp_k + 1`` query tokens, so the scheduled
+        token count is used as ``N_Q`` for both branches (rather than a
+        hardcoded 1) to avoid undercounting.
 
         This is a no-op (leaves the fields ``None``) unless profiling is active
-        and ``ATOM_ENABLE_ROOFLINE_ANNOTATION`` is set.
+        and ``ATOM_ENABLE_DETAILED_ANNOTATION`` is set.
         """
-        if not self.profile_active or not envs.ATOM_ENABLE_ROOFLINE_ANNOTATION:
+        if not self.profile_active or not self._detailed_annotation_enabled:
             return
 
         sqsq = 0  # sum N_Q^2
@@ -1710,14 +1716,15 @@ class Scheduler:
         for seq, num_tokens in zip(
             seqs.values(), scheduled_batch.num_scheduled_tokens
         ):
+            # Cast to Python int: num_scheduled_tokens is np.int32, so nq*nq /
+            # nq*nkv would overflow once a prefill/chunk exceeds ~46341 tokens
+            # (e.g. np.int32(65536)**2 == 0), silently corrupting the estimate.
+            nq = int(num_tokens)  # query tokens scheduled this forward
             if seq.type == SequenceType.DECODE:
-                nq = 1
-                nkv = seq.num_tokens  # full sequence length
+                nkv = int(seq.num_tokens)  # full sequence length
             else:
-                # PREFILL: num_tokens scheduled is the query length,
-                # KV length = cached + new tokens.
-                nq = num_tokens
-                nkv = seq.num_cached_tokens + num_tokens
+                # PREFILL: KV length = cached + new tokens.
+                nkv = int(seq.num_cached_tokens) + nq
             sqsq += nq * nq
             sqsk += nq * nkv
             sk += nkv

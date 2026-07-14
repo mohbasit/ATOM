@@ -1946,7 +1946,7 @@ class ModelRunner:
 
         These fields are only populated by
         :meth:`Scheduler.compute_roofline_aggregates` when profiling is active
-        and ``ATOM_ENABLE_ROOFLINE_ANNOTATION`` is set, so on the normal
+        and ``ATOM_ENABLE_DETAILED_ANNOTATION`` is set, so on the normal
         (unprofiled) path this returns an empty string without any extra work.
         Appending here keeps the annotation on the ``prefill[]``/``decode[]``
         ``record_function`` (a GPU-recognized layer) instead of nesting an
@@ -2310,11 +2310,18 @@ class ModelRunner:
                 # Invariant: exactly two prof.step() calls happen per captured
                 # batch size (schedule wait=1 + active=1, repeat=0), so
                 # on_trace_ready fires once per bs, in self.graph_bs order.
-                assert self._profile_bs_idx < len(self.graph_bs), (
-                    f"capture profiler fired {self._profile_bs_idx + 1} times "
-                    f"but only {len(self.graph_bs)} batch sizes were captured; "
-                    "check the prof.step() cadence in capture_cudagraph."
-                )
+                # This is a profiling-only diagnostic; log-and-skip rather than
+                # assert so a cadence mismatch can never abort CUDA-graph
+                # capture at server startup (and isn't stripped under python -O).
+                if self._profile_bs_idx >= len(self.graph_bs):
+                    logger.warning(
+                        "capture profiler fired %d times but only %d batch "
+                        "sizes were captured; skipping extra trace. Check the "
+                        "prof.step() cadence in capture_cudagraph.",
+                        self._profile_bs_idx + 1,
+                        len(self.graph_bs),
+                    )
+                    return
                 bs = self.graph_bs[self._profile_bs_idx]
                 trace_file = os.path.join(
                     self.capture_traces_dir, f"bs_{bs}_rank{self.rank}.json.gz"

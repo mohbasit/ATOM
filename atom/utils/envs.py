@@ -93,8 +93,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
     # When profiling is active, append roofline FLOP aggregates (sqsq, sqsk, sk)
     # to the prefill[]/decode[] trace labels emitted by ModelRunner.run_model.
-    "ATOM_ENABLE_ROOFLINE_ANNOTATION": lambda: (
-        os.getenv("ATOM_ENABLE_ROOFLINE_ANNOTATION", "0") == "1"
+    "ATOM_ENABLE_DETAILED_ANNOTATION": lambda: (
+        os.getenv("ATOM_ENABLE_DETAILED_ANNOTATION", "0") == "1"
     ),
     "ATOM_PROFILER_TIMEOUT": lambda: float(os.getenv("ATOM_PROFILER_TIMEOUT", "300")),
     "ATOM_LOG_MORE": lambda: int(os.getenv("ATOM_LOG_MORE", "0")) != 0,

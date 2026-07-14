@@ -84,7 +84,6 @@ class EngineCore:
         )
         self.input_thread.start()
 
-        self.profile_enbaled = config.torch_profiler_dir is not None
         self.mark_trace = getattr(config, "mark_trace", False)
         init_exit_handler(self)
         self._init_data_parallel(config)
@@ -435,27 +434,6 @@ class EngineCore:
                         f"{self.label}: output send {EngineCoreRequestType.SHUTDOWN}"
                     )
                     break
-
-    def start_profiler(self):
-        if self.profile_enbaled:
-            self.scheduler.profile_active = True
-            self.runner_mgr.call_func("start_profiler", wait_out=True)
-
-    def stop_profiler(self):
-        if self.profile_enbaled:
-            logger.info("Profiler stopping...")
-            t0 = time.monotonic()
-            self.runner_mgr.call_func("stop_profiler", wait_out=True)
-            self.scheduler.profile_active = False
-            logger.info("Profiler stopped in %.1fs", time.monotonic() - t0)
-
-    def print_mtp_statistics(self):
-        if self.scheduler.spec_stats is not None:
-            self.scheduler.spec_stats._log()
-        else:
-            logger.info(
-                "\n[MTP Stats] No MTP statistics available (MTP not enabled or no tokens processed)\n"
-            )
 
 
 class DPEngineCoreProc(EngineCore):
