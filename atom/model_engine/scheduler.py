@@ -1648,9 +1648,7 @@ class Scheduler:
         sqsq = 0  # sum N_Q^2
         sqsk = 0  # sum N_Q*N_KV
         sk = 0  # sum N_KV
-        for seq, num_tokens in zip(
-            seqs.values(), scheduled_batch.num_scheduled_tokens
-        ):
+        for seq, num_tokens in zip(seqs.values(), scheduled_batch.num_scheduled_tokens):
             # Cast to Python int: num_scheduled_tokens is np.int32, so nq*nq /
             # nq*nkv would overflow once a prefill/chunk exceeds ~46341 tokens
             # (e.g. np.int32(65536)**2 == 0), silently corrupting the estimate.

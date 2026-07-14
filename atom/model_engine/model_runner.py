@@ -2441,9 +2441,7 @@ class ModelRunner:
         )
         if self._capture_profile_enabled:
             self._profile_bs_idx = 0
-            self.capture_traces_dir = os.path.join(
-                self.profiler_dir, "capture_traces"
-            )
+            self.capture_traces_dir = os.path.join(self.profiler_dir, "capture_traces")
             os.makedirs(self.capture_traces_dir, exist_ok=True)
             logger.info(f"{self.label}: Starting CUDA graph capture profiler...")
 
@@ -2476,9 +2474,7 @@ class ModelRunner:
                     torch_profiler.ProfilerActivity.CUDA,
                     torch_profiler.ProfilerActivity.CPU,
                 ],
-                schedule=torch_profiler.schedule(
-                    wait=1, warmup=0, active=1, repeat=0
-                ),
+                schedule=torch_profiler.schedule(wait=1, warmup=0, active=1, repeat=0),
                 record_shapes=True,
                 with_stack=True,
                 profile_memory=False,
