@@ -130,7 +130,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # --- Profiling & Logging ---
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",
-    # When profiling is active, append roofline FLOP aggregates (sqsq, sqsk, sk)
+    # When profiling is active, append detailed attention aggregates (sqsq, sqsk, sk)
     # to the prefill[]/decode[] trace labels emitted by ModelRunner.run_model.
     "ATOM_ENABLE_DETAILED_ANNOTATION": lambda: (
         os.getenv("ATOM_ENABLE_DETAILED_ANNOTATION", "0") == "1"

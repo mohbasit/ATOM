@@ -299,7 +299,7 @@ class EngineCore:
         # Run the model forward pass if there are actual sequences
         has_seqs = len(scheduled_batch.req_ids) > 0
         if has_seqs:
-            self.scheduler.compute_roofline_aggregates(scheduled_batch, seqs)
+            self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )

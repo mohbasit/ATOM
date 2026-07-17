@@ -247,8 +247,8 @@ class EngineUtilityHandler:
 
     def _handle_start_profile(self, args: dict):
         result = self.runner_mgr.call_func("start_profiler", wait_out=True)
-        # Flip the scheduler flag so per-iteration roofline aggregates
-        # (compute_roofline_aggregates) are emitted while profiling is active.
+        # Flip the scheduler flag so per-iteration detailed aggregates
+        # (compute_detailed_aggregates) are emitted while profiling is active.
         if self.scheduler is not None:
             self.scheduler.profile_active = True
         logger.info(f"{self.label}: profiler started")

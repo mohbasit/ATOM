@@ -344,13 +344,13 @@ class ScheduledBatch:
         self.is_dummy_run = is_dummy_run
         self.num_spec_step = num_spec_step
 
-        # Roofline FLOP aggregates (set by Scheduler.compute_roofline_aggregates
+        # Detailed attention aggregates (set by Scheduler.compute_detailed_aggregates
         # when profiling is active and ATOM_ENABLE_DETAILED_ANNOTATION is set).
         # None on the normal path; consumed by ModelRunner.run_model to extend
         # the prefill[]/decode[] trace labels.
-        self.roofline_sqsq: int | None = None  # sum N_Q^2
-        self.roofline_sqsk: int | None = None  # sum N_Q*N_KV
-        self.roofline_sk: int | None = None  # sum N_KV
+        self.detailed_sqsq: int | None = None  # sum N_Q^2
+        self.detailed_sqsk: int | None = None  # sum N_Q*N_KV
+        self.detailed_sk: int | None = None  # sum N_KV
 
         # Collect multimodal data from prefill sequences
         self.multimodal_data = {}
@@ -470,7 +470,7 @@ class Scheduler:
         )
         self.profile_active = False
         # Cache the env flag once (env vars are fixed at process start) so the
-        # per-iteration compute_roofline_aggregates never pays an os.getenv.
+        # per-iteration compute_detailed_aggregates never pays an os.getenv.
         self._detailed_annotation_enabled = envs.ATOM_ENABLE_DETAILED_ANNOTATION
 
         self.enable_chunked_prefill = config.enable_chunked_prefill
@@ -1721,15 +1721,15 @@ class Scheduler:
             self.running.remove(seq)
         return finished_seqs
 
-    def compute_roofline_aggregates(
+    def compute_detailed_aggregates(
         self,
         scheduled_batch: ScheduledBatch,
         seqs: dict[int, Sequence],
     ) -> None:
-        """Attach roofline FLOP aggregates to *scheduled_batch* in place.
+        """Attach detailed attention aggregates to *scheduled_batch* in place.
 
-        Only the quadratic terms genuinely needed for a roofline FLOP estimate
-        are computed here. The request counts and total query tokens are
+        Only the quadratic terms genuinely needed for a downstream attention-FLOP
+        estimate are computed here. The request counts and total query tokens are
         already emitted by the ``prefill[]``/``decode[]`` labels in
         :meth:`ModelRunner.run_model`, so this avoids duplicating them.
 
@@ -1744,7 +1744,7 @@ class Scheduler:
         ``N_KV`` is its KV length (cached + new tokens for prefill, full
         sequence length for decode). Aggregating over every request in the
         batch gives the total for that single forward, which is exactly the
-        quantity a per-iteration roofline point needs. For MTP/spec-decode a
+        quantity a per-iteration attention-FLOP estimate needs. For MTP/spec-decode a
         decode step schedules ``mtp_k + 1`` query tokens, so the scheduled
         token count is used as ``N_Q`` for both branches (rather than a
         hardcoded 1) to avoid undercounting.
@@ -1772,9 +1772,9 @@ class Scheduler:
             sqsk += nq * nkv
             sk += nkv
 
-        scheduled_batch.roofline_sqsq = sqsq
-        scheduled_batch.roofline_sqsk = sqsk
-        scheduled_batch.roofline_sk = sk
+        scheduled_batch.detailed_sqsq = sqsq
+        scheduled_batch.detailed_sqsk = sqsk
+        scheduled_batch.detailed_sk = sk
 
     def _connector_flag(self, name: str) -> bool:
         return bool(getattr(self.kv_connector, name, False))

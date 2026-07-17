@@ -40,15 +40,15 @@ def build_run_label(
     tbo_on: bool,
     bs: int,
     batch: Optional["ScheduledBatch"],
-    roofline_suffix: str = "",
+    detailed_suffix: str = "",
 ) -> str:
     """Build the ``record_function`` label for one forward pass.
 
     Pure function (no runtime state) — see module docstring for the taxonomy.
 
-    ``roofline_suffix`` is an already-formatted ``" key=value ..."`` fragment
+    ``detailed_suffix`` is an already-formatted ``" key=value ..."`` fragment
     (empty on the normal path) appended inside the brackets; see
-    ``ModelRunner._roofline_label_suffix``.
+    ``ModelRunner._detailed_label_suffix``.
     """
     if use_cudagraph:
         kind = "dummy_decode" if is_dummy else "decode"
@@ -75,7 +75,7 @@ def build_run_label(
             else:
                 ctx_str = f"{ctx[:3].tolist()}...+{len(ctx) - 3}"
             label += f" tok={batch.total_tokens_num} ctx={ctx_str}"
-    label += roofline_suffix
+    label += detailed_suffix
     if tbo_on:
         label += " tbo=1"
     label += "]"

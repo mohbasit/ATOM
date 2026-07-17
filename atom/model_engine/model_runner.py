@@ -2043,23 +2043,23 @@ class ModelRunner:
         )
 
     @staticmethod
-    def _roofline_label_suffix(batch: Optional[ScheduledBatch]) -> str:
-        """Roofline FLOP aggregates for the trace label, or ``""``.
+    def _detailed_label_suffix(batch: Optional[ScheduledBatch]) -> str:
+        """Detailed attention aggregates for the trace label, or ``""``.
 
         These fields are only populated by
-        :meth:`Scheduler.compute_roofline_aggregates` when profiling is active
+        :meth:`Scheduler.compute_detailed_aggregates` when profiling is active
         and ``ATOM_ENABLE_DETAILED_ANNOTATION`` is set, so on the normal
         (unprofiled) path this returns an empty string without any extra work.
         Appending here keeps the annotation on the ``prefill[]``/``decode[]``
         ``record_function`` (a GPU-recognized layer) instead of nesting an
         extra span above ``run_model``.
         """
-        if batch is None or batch.roofline_sqsq is None:
+        if batch is None or batch.detailed_sqsq is None:
             return ""
         return (
-            f" sqsq={batch.roofline_sqsq}"
-            f" sqsk={batch.roofline_sqsk}"
-            f" sk={batch.roofline_sk}"
+            f" sqsq={batch.detailed_sqsq}"
+            f" sqsk={batch.detailed_sqsk}"
+            f" sk={batch.detailed_sk}"
         )
 
     def run_model(
@@ -2097,7 +2097,7 @@ class ModelRunner:
             tbo_on=forward_context.ubatch_slices is not None,
             bs=bs,
             batch=batch,
-            roofline_suffix=self._roofline_label_suffix(batch),
+            detailed_suffix=self._detailed_label_suffix(batch),
         )
 
         if not forward_mode.use_cudagraph:
