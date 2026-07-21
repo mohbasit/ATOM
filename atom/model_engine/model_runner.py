@@ -2719,7 +2719,7 @@ class ModelRunner:
         """Detailed attention aggregates for the trace label, or ``""``.
 
         These fields are only populated by
-        :meth:`Scheduler.compute_detailed_aggregates` when profiling is active
+        `Scheduler.compute_detailed_aggregates` when profiling is active
         and ``ATOM_ENABLE_DETAILED_ANNOTATION`` is set, so on the normal
         (unprofiled) path this returns an empty string without any extra work.
         Appending here keeps the annotation on the ``prefill[]``/``decode[]``
