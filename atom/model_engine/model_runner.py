@@ -2886,21 +2886,6 @@ class ModelRunner:
             detailed_suffix=self._detailed_label_suffix(batch),
         )
 
-        # Profiler label. Kind (prefix) distinguishes real/dummy and
-        # eager/cudagraph; `tbo=1` marks a step that ran TBO ubatches. See
-        # `build_run_label`.
-        label = build_run_label(
-            is_prefill=is_prefill,
-            use_cudagraph=forward_mode.use_cudagraph,
-            is_dummy=context.is_dummy_run,
-            tbo_on=forward_context.ubatch_slices is not None,
-            bs=bs,
-            # The CUDAGraph replays a padded batch (context.graph_bs); pass it so
-            # the label shows bs=<real>/<graph> when they differ.
-            graph_bs=context.graph_bs if forward_mode.use_cudagraph else None,
-            batch=batch,
-        )
-
         # PCP+TBO prefill: per-group round-robin stripe before UBatchWrapper (see
         # _apply_pcp_balanced_stripe). _pcp_tbo_balanced also gates the per-group
         # output restore further below.
